@@ -1,0 +1,245 @@
+---
+title: "DelayedMatrixStats"
+subtitle: "Porting the matrixStats API to work with DelayedMatrix objects"
+author: "Peter Hickey (@PeteHaitch)"
+date: "2017-07-26"
+output:
+  xaringan::moon_reader:
+    lib_dir: libs
+    nature:
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+      ratio: 4:3
+    self_contained: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+options(htmltools.dir.version = FALSE)
+knitr::opts_chunk$set(comment = "#>", message = FALSE, warning = FALSE,
+                      collapse = TRUE)
+
+library(rlang)
+library(microbenchmark)
+library(profmem)
+library(Matrix)
+library(HDF5Array)
+library(matterArray) # GitHub only package
+library(DelayedMatrixStats)
+
+# NOTE: This uses some pretty crude, example-specific rounding
+benchmark <- function(...) {
+  quos <- quos(...)
+  bm <- eval_tidy(quo(microbenchmark(!!!quos)))
+  mem <- sapply(quos[-length(quos)], function(x) {
+    total(eval_tidy(quo(profmem(!!!x))))
+  })
+  s <- summary(bm)
+  # NOTE: Hack to remove leading ~
+  s$expr <- gsub("~", "", s$expr)
+  timing_cols <- c("min", "lq", "median", "uq", "max")
+  unit <- attr(s, "unit")
+  unit <- ifelse(unit == "milliseconds", "ms", unit)
+  unit <- ifelse(unit == "microseconds", "μs", unit)
+  unit <- ifelse(unit == "seconds", "s", unit)
+  s$median <- signif(s$median, 3)
+  val <- cbind(s[, c("expr", "median")],
+               data.frame("MB" = round(mem / 10 ^ 6, 1))) 
+  colnames(val) <- c("expr", paste0("Median time (", unit, ")"), 
+                     "Mem alloc (MB)")
+  print(val, row.names = FALSE)
+}
+
+file_size <- function(x) {
+  pryr:::show_bytes(structure(file.size(x), class = "object_size"))
+}
+```
+
+# Why **matrixStats**?
+
+[**matrixStats**](https://cran.r-project.org/package=matrixStats) by Henrik Bengtsson and co. on CRAN since 2009
+
+--
+
+Lots of useful col/row summary functions
+
+```{r}
+grep("^col", getNamespaceExports("matrixStats"), value = TRUE)
+```
+
+---
+
+## Optimised row/column operations on _matrix_ objects
+
+```{r}
+# Simulate some zero-inflated count data
+matrix <- matrix(sample(0:100, 20000 * 10000, replace = TRUE), 
+                 nrow = 20000,
+                 ncol = 10000)
+matrix[sample(length(matrix), length(matrix) * 0.6)] <- 0L
+
+library(matrixStats)
+benchmark(apply(matrix, 2, median), 
+          colMedians(matrix),
+          times = 10)
+```
+
+---
+
+# Why **matrixStats**?
+
+## Optimised row/column operations on _matrix_ objects
+
+```{r}
+j <- c(2001:3000, 5001:5500)
+benchmark(colSums(matrix[, j]), 
+          colSums2(matrix, cols = j), 
+          times = 10)
+```
+
+---
+
+# Big data blues
+
+- You've got matrix-like data but too large for in-memory _matrix_ :(
+
+--
+
+## _DelayedMatrix_!
+
+- A wrapper around a matrix-like object 
+- Data can be in memory or on disk
+- _DelayedMatrix_ works as an assay in a _SummarizedExperiment_
+- _DelayedMatrix_ supports the standard & familiar _matrix_ API<sup>*</sup>
+  - `[`
+  - `dim()`
+  - `dimnames()`
+  - `t()`
+  - `log()`
+  - **`colSums()`**
+  - ...
+
+.footnote[[*] But not subassignment]
+
+---
+
+# _DelayedMatrix_ backends
+
+## In-memory backends
+
+```{r}
+DelayedMatrix <- DelayedArray::DelayedArray(matrix)
+pryr::object_size(DelayedMatrix)
+
+DelayeddgCMatrix <- DelayedArray(as(matrix, "dgCMatrix"))
+pryr::object_size(DelayeddgCMatrix) # Larger than dense version!
+
+RleMatrix <- RleArray(Rle(matrix), dim = dim(matrix))
+pryr::object_size(RleMatrix)        # Low RLE compressibility
+
+TricksyRleMatrix <- as(matrix, "RleMatrix") # Uses tricksy tricks
+pryr::object_size(TricksyRleMatrix) # Tricksy tricks in play
+```
+
+---
+
+# _DelayedMatrix_ backends
+
+## On-disk backends
+
+```{r}
+HDF5Matrix <- HDF5Array::writeHDF5Array(matrix)
+pryr::object_size(HDF5Matrix)
+file_size(HDF5Matrix@seed@file)
+
+matterMatrix <- matterArray::writeMatterArray(matrix)
+pryr::object_size(matterMatrix)
+file_size(matterMatrix@seed@matter@paths)
+```
+
+---
+
+class: center, inverse
+
+# Why **DelayedMatrixStats**?
+
+--
+
+![https://cdn.meme.am/cache/instances/folder347/500x/80002347/the-one-ring-one-api-to-rule-them-all.jpg](https://cdn.meme.am/cache/instances/folder347/500x/80002347/the-one-ring-one-api-to-rule-them-all.jpg)
+
+---
+
+# Why **DelayedMatrixStats**?
+
+- Support **matrixStats** API for _DelayedMatrix_ and derived classes
+- Reduce friction between using _matrix_ or _DelayedMatrix_
+
+--
+
+## Initial release aim
+
+General 'block-processing' method to work for _DelayedMatrix_ and arbitrary 
+derived classes
+
+--
+
+## Subsequent releases
+
+'Backend-aware' optimised methods
+
+---
+
+# Why **DelayedMatrixStats**?
+
+## Yay, same syntax works regardless of backend!
+
+```{r, error = TRUE}
+benchmark(colMedians(matrix),
+          colMedians(DelayedMatrix),
+          colMedians(DelayeddgCMatrix),
+          colMedians(RleMatrix),
+          colMedians(TricksyRleMatrix),
+          colMedians(HDF5Matrix), 
+          colMedians(matterMatrix), 
+          times = 10)
+
+# Aside: apply(DelayedMatrix, 2, median) currently doesn't work
+```
+
+---
+
+# Why **DelayedMatrixStats**?
+
+## Backend-aware methods can improve performance
+
+
+```{r}
+CS <- function(x, j) colSums(x[, j])        # DelayedArray
+CS2 <- function(x, j) colSums2(x, cols = j) # DelayedMatrixStats
+j <- c(2001:3000, 5001:5500)
+benchmark(CS(DelayedMatrix, j),             # Block-processing
+          CS2(DelayedMatrix, j),            # Backend-aware
+          CS(DelayeddgCMatrix, j),          # Block-processing
+          CS2(DelayeddgCMatrix, j),         # Backend-aware
+          CS(RleMatrix, j),                 # Block-processing
+          CS2(RleMatrix, j),                # Backend-aware
+          times = 10)
+```
+
+---
+
+class: center, middle
+
+# For more
+
+**DelayedMatrixStats:** [https://github.com/PeteHaitch/DelayedMatrixStats](https://github.com/PeteHaitch/DelayedMatrixStats)
+
+**matter:** Developed by Kylie A. Bemis [https://bioconductor.org/packages/matter/](https://bioconductor.org/packages/matter/)
+
+**matterArray:** [https://github.com/PeteHaitch/matterArray](https://github.com/PeteHaitch/matterArray)
+
+**Slides:** [http://peterhickey.org/presentations/](http://peterhickey.org/presentations/)
+
+**GitHub & Twitter:** [@PeteHaitch](https://twitter.com/PeteHaitch)
